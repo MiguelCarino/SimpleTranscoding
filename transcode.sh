@@ -1,5 +1,156 @@
 #!/bin/bash
 
+# Default settings
+VIDEO_CODEC="libx264"
+OUTPUT_EXTENSION="mp4"
+KEEP_AUDIO_SUBS=true
+SELECTED_AUDIO_INDEX=""
+SELECTED_SUBTITLE_INDEX=""
+RESOLUTION="original"
+QUALITY=23
+GPU_TYPE="none"
+PASSES=1
+
+# Function to detect GPU
+function detect_gpu {
+    if lspci | grep -i "nvidia" &>/dev/null; then
+        GPU_TYPE="nvidia"
+    elif lspci | grep -i "intel" &>/dev/null; then
+        GPU_TYPE="intel"
+    elif lspci | grep -i "amd" &>/dev/null; then
+        GPU_TYPE="amd"
+    else
+        GPU_TYPE="none"
+    fi
+}
+
+detect_gpu
+
+# Argument Parsing
+FILES_TO_PROCESS=()
+for arg in "$@"; do
+    case $arg in
+        vp9) 
+            case $GPU_TYPE in
+                nvidia) VIDEO_CODEC="vp9_vaapi" ;;
+                intel)  VIDEO_CODEC="vp9_qsv" ;;
+                *)      VIDEO_CODEC="libvpx-vp9" ;;
+            esac
+            OUTPUT_EXTENSION="webm"
+            ;;
+        av1) 
+            case $GPU_TYPE in
+                nvidia) VIDEO_CODEC="av1_nvenc" ;;
+                intel)  VIDEO_CODEC="av1_qsv" ;;
+                amd)    VIDEO_CODEC="av1_amf" ;;
+                *)      VIDEO_CODEC="libaom-av1" ;;
+            esac
+            OUTPUT_EXTENSION="mkv"
+            ;;
+        hevc) 
+            case $GPU_TYPE in
+                nvidia) VIDEO_CODEC="hevc_nvenc" ;;
+                intel)  VIDEO_CODEC="hevc_qsv" ;;
+                amd)    VIDEO_CODEC="hevc_amf" ;;
+                *)      VIDEO_CODEC="libx265" ;;
+            esac
+            OUTPUT_EXTENSION="mkv"
+            ;;
+        h264) 
+            case $GPU_TYPE in
+                nvidia) VIDEO_CODEC="h264_nvenc" ;;
+                intel)  VIDEO_CODEC="h264_qsv" ;;
+                amd)    VIDEO_CODEC="h264_amf" ;;
+                *)      VIDEO_CODEC="libx264" ;;
+            esac
+            OUTPUT_EXTENSION="mp4"
+            ;;
+        quality=*) QUALITY="${arg#*=}" ;;
+        1080) RESOLUTION="1080" ;;
+        720)  RESOLUTION="720" ;;
+        no-audio-subs) KEEP_AUDIO_SUBS=false ;;
+        audio=*) SELECTED_AUDIO_INDEX="${arg#*=}"; KEEP_AUDIO_SUBS=false ;;
+        subs=*)  SELECTED_SUBTITLE_INDEX="${arg#*=}" ;;
+        passes=*) PASSES="${arg#*=}" ;;
+        *)
+            if [[ -f "$arg" ]]; then FILES_TO_PROCESS+=("$arg"); fi
+            ;;
+    esac
+done
+
+if [[ ${#FILES_TO_PROCESS[@]} -eq 0 ]]; then
+    shopt -s nullglob
+    FILES_TO_PROCESS=(*.mkv *.mp4 *.avi *.mov *.ts)
+fi
+
+# Function to get quality flags based on codec
+get_quality_flags() {
+    local codec=$1
+    case $codec in
+        *nvenc)      echo "-rc vbr -cq $QUALITY -preset p6" ;;
+        *qsv)        echo "-global_quality $QUALITY -preset slow" ;;
+        *amf)        echo "-rc cqp -qp_p $QUALITY -qp_i $QUALITY" ;;
+        libvpx-vp9)  echo "-crf $QUALITY -b:v 0 -deadline good -cpu-used 2" ;;
+        libx26*|libaom*) echo "-crf $QUALITY -preset slow" ;;
+        *)           echo "-crf $QUALITY" ;;
+    esac
+}
+
+for file in "${FILES_TO_PROCESS[@]}"; do
+    if [[ -e "$file" ]]; then
+        base_name="${file%.*}"
+        output_file="${base_name}_encoded.${OUTPUT_EXTENSION}"
+        
+        # Audio/Subtitle Logic
+        AUDIO_MAP="-map 0:a?"
+        SUBTITLE_MAP="-map 0:s?"
+        AUDIO_CODEC="-c:a copy"
+        SUBTITLE_CODEC="-c:s copy"
+        AUDIO_FILTERS=""
+
+        if [[ "$OUTPUT_EXTENSION" == "webm" ]]; then
+            # Fix for the libopus mapping family error (downmix to stereo)
+            AUDIO_CODEC="-c:a libopus -b:a 128k"
+            AUDIO_FILTERS="-af aformat=channel_layouts=stereo"
+            SUBTITLE_CODEC="-c:s webvtt"
+        fi
+
+        # Resolution filter
+        SCALE_FILTER=""
+        [[ "$RESOLUTION" == "1080" ]] && SCALE_FILTER="scale=-1:1080"
+        [[ "$RESOLUTION" == "720" ]]  && SCALE_FILTER="scale=-1:720"
+        
+        # Format the filter string correctly
+        VF_STRING=""
+        [[ -n "$SCALE_FILTER" ]] && VF_STRING="-vf $SCALE_FILTER"
+
+        QUALITY_OPTIONS=$(get_quality_flags "$VIDEO_CODEC")
+
+        echo "--- Processing: $file ---"
+        
+        # Attempt conversion
+        ffmpeg -y -i "$file" -c:v "$VIDEO_CODEC" $VF_STRING $QUALITY_OPTIONS \
+            $AUDIO_CODEC $AUDIO_FILTERS $SUBTITLE_CODEC -map 0:v $AUDIO_MAP $SUBTITLE_MAP "$output_file"
+
+        # FALLBACK LOGIC
+        if [[ $? -ne 0 ]]; then
+            echo "Hardware encoding failed. Falling back to CPU (Software)..."
+            
+            # Reset codec to software equivalent
+            case $VIDEO_CODEC in
+                *vp9*)  FALLBACK_CODEC="libvpx-vp9" ;;
+                *hevc*|*x265*) FALLBACK_CODEC="libx265" ;;
+                *)      FALLBACK_CODEC="libx264" ;;
+            esac
+            
+            QUALITY_OPTIONS=$(get_quality_flags "$FALLBACK_CODEC")
+            
+            ffmpeg -y -i "$file" -c:v "$FALLBACK_CODEC" $VF_STRING $QUALITY_OPTIONS \
+                $AUDIO_CODEC $AUDIO_FILTERS $SUBTITLE_CODEC -map 0:v $AUDIO_MAP $SUBTITLE_MAP "$output_file"
+        fi
+    fi
+done#!/bin/bash
+
 # ==============================================================================
 # Universal Transcoder Script
 # Supports: NVIDIA (NVENC), Intel (QSV), AMD (AMF), and Software (x264/x265/VP9)
